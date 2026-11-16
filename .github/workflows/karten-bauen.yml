@@ -1,0 +1,96 @@
+# Baut einmal im Monat das Kartenpaket für den Spur-Assistenten und stellt es
+# als Release-Datei unter dem festen Tag "kartenpaket" bereit.
+# Die App lädt: https://github.com/<besitzer>/spur-karten/releases/download/kartenpaket/kartenpaket-nds-nrw.zip
+name: Kartenpaket bauen
+
+on:
+  schedule:
+    - cron: "23 2 3 * *"   # am 3. jedes Monats um 02:23 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: kartenpaket
+  cancel-in-progress: false
+
+env:
+  # Geofabrik-Extrakte (Pfad unter https://download.geofabrik.de/).
+  # Niedersachsen, NRW und Bremen sind der Kern. Die Nachbarn sorgen dafür, dass die
+  # Kartenteile an den Grenzen vollständig sind (z. B. Nordhorn direkt an den Niederlanden).
+  EXTRAKTE: >-
+    europe/germany/niedersachsen-latest.osm.pbf
+    europe/germany/nordrhein-westfalen-latest.osm.pbf
+    europe/germany/bremen-latest.osm.pbf
+    europe/germany/hamburg-latest.osm.pbf
+    europe/germany/schleswig-holstein-latest.osm.pbf
+    europe/germany/mecklenburg-vorpommern-latest.osm.pbf
+    europe/germany/brandenburg-latest.osm.pbf
+    europe/germany/sachsen-anhalt-latest.osm.pbf
+    europe/germany/thueringen-latest.osm.pbf
+    europe/germany/hessen-latest.osm.pbf
+    europe/germany/rheinland-pfalz-latest.osm.pbf
+    europe/netherlands-latest.osm.pbf
+    europe/belgium-latest.osm.pbf
+
+jobs:
+  bauen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Werkzeuge installieren
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q osmium-tool
+          pip install -r requirements.txt
+
+      - name: Extrakte laden und vorfiltern
+        run: |
+          mkdir -p daten
+          for e in $EXTRAKTE; do
+            name=$(basename "$e")
+            echo "::group::$name"
+            curl -fSL --retry 5 --retry-delay 30 -o "daten/roh.osm.pbf" "https://download.geofabrik.de/$e"
+            ls -lh daten/roh.osm.pbf
+            # Nur, was die App braucht (plus die Knoten der Wege und die Mitglieder der Relationen)
+            osmium tags-filter daten/roh.osm.pbf \
+              w/highway=motorway,motorway_link,trunk,trunk_link,primary,primary_link,secondary,tertiary,unclassified,residential,living_street \
+              n/highway=motorway_junction \
+              nwr/highway=services,rest_area \
+              nwr/amenity=fuel,charging_station,restaurant,fast_food,cafe,toilets,pharmacy,hospital,parking \
+              nwr/place=city,town,village,suburb \
+              -o "daten/gefiltert-$name" --overwrite
+            rm daten/roh.osm.pbf
+            ls -lh "daten/gefiltert-$name"
+            echo "::endgroup::"
+          done
+
+      - name: Kartenpaket bauen
+        run: python build.py --out kartenpaket-nds-nrw.zip --manifest manifest.json daten/gefiltert-*.osm.pbf
+
+      - name: Größe anzeigen
+        run: |
+          ls -lh kartenpaket-nds-nrw.zip manifest.json
+          echo "DATUM=$(python -c 'import json;print(json.load(open("manifest.json"))["datum"])')" >> "$GITHUB_ENV"
+
+      - name: Als Release "kartenpaket" veröffentlichen (alte Dateien werden ersetzt)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: kartenpaket
+          name: Kartenpaket Niedersachsen + NRW
+          body: |
+            Kartenpaket für den Spur-Assistenten, Stand ${{ env.DATUM }}.
+            Wird jeden Monat automatisch neu gebaut.
+            Kartendaten © OpenStreetMap-Mitwirkende, ODbL 1.0 (über Geofabrik).
+          files: |
+            kartenpaket-nds-nrw.zip
+            manifest.json
+          overwrite_files: true
+          make_latest: true
