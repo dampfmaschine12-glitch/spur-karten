@@ -66,6 +66,7 @@ jobs:
               nwr/highway=services,rest_area \
               nwr/amenity=fuel,charging_station,restaurant,fast_food,cafe,toilets,pharmacy,hospital,parking \
               nwr/place=city,town,village,suburb \
+              r/type=destination_sign \
               -o "daten/gefiltert-$name" --overwrite
             rm daten/roh.osm.pbf
             ls -lh "daten/gefiltert-$name"

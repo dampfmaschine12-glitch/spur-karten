@@ -2,13 +2,22 @@
 """
 Baut das Kartenpaket für den Spur-Assistenten aus Geofabrik-Extrakten (.osm.pbf).
 
-Erzeugt genau das Kachelformat, das die App (OfflineMap.fetchTile) selbst über Overpass schreibt:
+Erzeugt genau das Kachelformat, das die App (MapTiles.kt / OfflineMap.fetchTile) selbst über Overpass schreibt:
 
-  Dateiname: "<ix>_<iy>.json" (schlank) bzw. "<ix>_<iy>.d.json" (detailliert, Heimatgebiet)
+  Dateiname: "<ix>_<iy>.json" (schlank), "<ix>_<iy>.d.json" (detailliert, Heimatgebiet)
+             bzw. "<ix>_<iy>.a.json" (nur Autobahnen, ganz Deutschland)
              ix = floor(lon / 0.25), iy = floor(lat / 0.25)
-  Inhalt:    {"r": [[highway, label, maxspeed, lanes, destination, [lat1e5, lon1e5, ...]], ...],
-              "p": [[type, name, lat1e5, lon1e5, extra], ...],
-              "t": <Millisekunden>}
+  Inhalt (Format 2, abwärtskompatibel zu Format 1 – die alten Felder bleiben an ihrer Stelle):
+             {"r": [[highway, label, maxspeed, lanes, destination, [lat1e5, lon1e5, ...], {zusatz}], ...],
+              "p": [[type, name, lat1e5, lon1e5, extra, {zusatz}], ...],
+              "s": [[lat1e5, lon1e5, vonWeg, nachWeg, {zusatz}], ...],   (Wegweiser-Relationen)
+              "v": 2, "t": <Millisekunden>}
+  {zusatz} ist optional und nutzt Kurz-Schlüssel (ROAD_TAGS / POI_TAGS / SIGN_TAGS – gleich wie in MapTiles.kt).
+
+Zwei Pakete:
+  kartenpaket-nds-nrw.zip      schlanke + detaillierte Kacheln (wie bisher, jetzt mit allen Knoten-Details)
+  autobahnen-deutschland.zip   ".a.json"-Kacheln: Autobahnen, Rampen, autobahnähnliche Straßen (trunk + motorroad),
+                               Anschlussstellen, Raststätten, Wegweiser – für ganz Deutschland
 
 Filter wie die Overpass-Abfragen in OfflineMap.query():
   schlank    (Niedersachsen + NRW): Autobahn/Schnellstraße/Bundesstraße, Ausfahrten, Raststätten,
@@ -20,7 +29,8 @@ Ein Weg kommt (wie bei Overpass mit bbox) in jede Kachel, die er berührt – mi
 Flächen/Relationen bekommen als Punkt die Mitte ihres Begrenzungsrechtecks (wie Overpass "out center").
 
 Aufruf:
-  python build.py --out kartenpaket-nds-nrw.zip niedersachsen-latest.osm.pbf nordrhein-westfalen-latest.osm.pbf ...
+  python build.py --out kartenpaket-nds-nrw.zip --out-autobahn autobahnen-deutschland.zip \\
+      niedersachsen-latest.osm.pbf nordrhein-westfalen-latest.osm.pbf ... autobahn-germany.osm.pbf
 """
 from __future__ import annotations
 
@@ -41,6 +51,34 @@ TILE = 0.25
 # Gleiche Gebiete wie OfflineMap.regions in der App (s, w, n, e)
 REGION_SLIM = (50.25, 5.75, 54.0, 11.75)   # Niedersachsen + Nordrhein-Westfalen
 REGION_DETAIL = (52.25, 6.75, 52.50, 7.50)  # Nordhorn – Schüttorf
+REGION_AB = (47.25, 5.75, 55.25, 15.25)     # ganz Deutschland (nur Autobahn-Schicht)
+
+MOTORWAY_KINDS = {"motorway", "motorway_link", "trunk", "trunk_link"}
+
+# OSM-Tag -> Kurz-Schlüssel im 7. Feld einer Straße. MUSS zu MapTiles.roadTags in der App passen.
+ROAD_TAGS = {
+    "ref": "r", "int_ref": "ir", "name": "n",
+    "lanes:forward": "lf", "lanes:backward": "lb",
+    "turn:lanes": "tl", "turn:lanes:forward": "tlf", "turn:lanes:backward": "tlb",
+    "destination": "d", "destination:forward": "df", "destination:backward": "db",
+    "destination:ref": "dr", "destination:ref:forward": "drf", "destination:ref:backward": "drb",
+    "destination:lanes": "dl", "destination:lanes:forward": "dlf", "destination:lanes:backward": "dlb",
+    "destination:ref:lanes": "drl", "destination:ref:lanes:forward": "drlf", "destination:ref:lanes:backward": "drlb",
+    "destination:symbol": "ds", "destination:symbol:lanes": "dsl",
+    "destination:colour": "dc", "destination:colour:lanes": "dcl",
+    "destination:ref:to": "drt", "destination:ref:to:lanes": "drtl",
+    "destination:int_ref": "dir", "destination:arrow": "da", "destination:arrow:lanes": "dal",
+    "junction:ref": "jr", "junction": "j",
+    "maxspeed:conditional": "mc", "maxspeed:variable": "mv", "maxspeed:hgv": "mh",
+    "bridge": "br", "tunnel": "tu", "layer": "ly",
+    "placement": "pl", "change:lanes": "cl", "change": "ch",
+    "hgv": "hg", "hgv:conditional": "hgc", "maxheight": "mxh", "maxweight": "mxw",
+    "construction": "co", "opening_date": "od", "motorroad": "mr", "access": "ac",
+}
+MINOR_SKIP = {"r", "ir", "n", "br", "tu", "ly", "mr"}  # bei kleinen Straßen weglassen (steht schon im Etikett)
+POI_TAGS = {"ref": "r", "name": "n", "exit_to": "et", "destination": "d", "destination:ref": "dr"}
+SIGN_TAGS = {"destination": "d", "destination:ref": "dr", "destination:symbol": "ds",
+             "colour:back": "c", "colour:text": "ct", "distance": "di"}
 
 ROAD_SLIM = {"motorway", "motorway_link", "trunk", "trunk_link", "primary"}
 ROAD_DETAIL = ROAD_SLIM | {"primary_link", "secondary", "tertiary", "unclassified", "residential", "living_street"}
@@ -75,6 +113,7 @@ def tiles_of(region) -> list[tuple[int, int]]:
 
 SLIM_TILES = set(tiles_of(REGION_SLIM))
 DETAIL_TILES = set(tiles_of(REGION_DETAIL))
+AB_TILES = set(tiles_of(REGION_AB))
 
 
 def tag(tags: dict, k: str):
@@ -83,7 +122,38 @@ def tag(tags: dict, k: str):
 
 
 def is_road(tags: dict, detailed: bool) -> bool:
-    return tags.get("highway") in (ROAD_DETAIL if detailed else ROAD_SLIM)
+    hw = tags.get("highway")
+    if hw == "construction":
+        return tags.get("construction") in MOTORWAY_KINDS
+    return hw in (ROAD_DETAIL if detailed else ROAD_SLIM)
+
+
+def is_ab_road(tags: dict) -> bool:
+    """Autobahn-Schicht: Autobahn, Rampen, autobahnähnliche Straße (trunk mit motorroad), Bau davon."""
+    hw = tags.get("highway")
+    if hw == "construction":
+        return tags.get("construction") in MOTORWAY_KINDS
+    if hw in ("motorway", "motorway_link", "trunk_link"):
+        return True
+    return hw == "trunk" and tags.get("motorroad") == "yes"
+
+
+def is_ab_poi(tags: dict, kind: str) -> bool:
+    hw = tags.get("highway")
+    return (kind == "n" and hw == "motorway_junction") or hw in REST
+
+
+def oneway_of(hw: str, tags: dict) -> int:
+    v = (tags.get("oneway") or "").strip().lower()
+    if v in ("yes", "true", "1"):
+        return 1
+    if v in ("-1", "reverse"):
+        return -1
+    if v in ("no", "false", "0"):
+        return 0
+    if tags.get("junction") == "roundabout":
+        return 1
+    return 1 if hw in ("motorway", "motorway_link") else 0
 
 
 def is_poi(tags: dict, kind: str, detailed: bool) -> bool:
@@ -104,18 +174,34 @@ def is_poi(tags: dict, kind: str, detailed: bool) -> bool:
     return kind == "n" and pl in PLACE_SLIM
 
 
-def road_entry(tags: dict, pts: list[int]):
-    """Wie der Weg-Zweig in OfflineMap.fetchTile()."""
+def road_entry(tags: dict, pts: list[int], wid: int = 0):
+    """Wie MapTiles.roadEntry() in der App."""
     hw = tag(tags, "highway")
     label = " ".join(v for v in (tag(tags, "ref"), tag(tags, "name")) if v is not None)
-    if label.strip() == "" and not (hw or "").endswith("_link"):
+    major = hw in MOTORWAY_KINDS or hw == "construction"
+    if label.strip() == "" and not (hw or "").endswith("_link") and hw != "construction":
         return None
     dest = tag(tags, "destination") or tag(tags, "destination:ref")
-    return [hw, label, tag(tags, "maxspeed") or "", tag(tags, "lanes") or "", dest or "", pts]
+    x = {}
+    for k, s in ROAD_TAGS.items():
+        if not major and s in MINOR_SKIP:
+            continue
+        v = tag(tags, k)
+        if v is not None:
+            x[s] = v
+    ow = oneway_of(hw, tags)
+    if ow != (1 if hw in ("motorway", "motorway_link") else 0):
+        x["o"] = ow
+    if major and wid:
+        x["i"] = wid
+    e = [hw, label, tag(tags, "maxspeed") or "", tag(tags, "lanes") or "", dest or "", pts]
+    if x:
+        e.append(x)
+    return e
 
 
-def poi_entry(tags: dict, lat: float, lon: float):
-    """Wie der Punkt-Zweig in OfflineMap.fetchTile()."""
+def poi_entry(tags: dict, lat: float, lon: float, oid: int = 0):
+    """Wie MapTiles.poiEntry() in der App."""
     typ = tag(tags, "highway")
     if typ is None:
         am = tag(tags, "amenity")
@@ -147,15 +233,25 @@ def poi_entry(tags: dict, lat: float, lon: float):
         city = tag(tags, "addr:city")
         addr = st + (" " + hn if hn else "") + (", " + city if city else "")
     extra = ", ".join(v for v in (tag(tags, "destination"), power, ("Öffnungszeiten " + oh) if oh else None, addr) if v is not None)
-    return [typ, name, jround(lat * 1e5), jround(lon * 1e5), extra]
+    e = [typ, name, jround(lat * 1e5), jround(lon * 1e5), extra]
+    if typ in ("motorway_junction", "services", "rest_area"):
+        x = {s: tag(tags, k) for k, s in POI_TAGS.items() if tag(tags, k) is not None}
+        if oid:
+            x["i"] = oid
+        if x:
+            e.append(x)
+    return e
 
 
 class Collector:
     def __init__(self):
-        # (ix, iy, detailed) -> {key: eintrag}
-        self.roads: dict[tuple[int, int, bool], dict] = {}
-        self.pois: dict[tuple[int, int, bool], dict] = {}
-        self.stats = {"roads": 0, "pois": 0}
+        # (ix, iy, schicht) -> {key: eintrag}; schicht: True = detailliert, False = schlank, "a" = Autobahn
+        self.roads: dict[tuple, dict] = {}
+        self.pois: dict[tuple, dict] = {}
+        self.signs: dict[tuple, dict] = {}
+        self.road_ids: set[int] = set()   # alle aufgenommenen Wege (für Wegweiser-Relationen)
+        self.ab_ids: set[int] = set()
+        self.stats = {"roads": 0, "pois": 0, "signs": 0}
 
     def _targets(self, x: int, y: int):
         out = []
@@ -170,14 +266,34 @@ class Collector:
         for detailed in self._targets(x, y):
             if not is_poi(tags, kind, detailed):
                 continue
-            e = poi_entry(tags, lat, lon)
+            e = poi_entry(tags, lat, lon, int(key[1:]))
             if e is None:
                 continue
             self.pois.setdefault((x, y, detailed), {})[key] = e
             self.stats["pois"] += 1
+        if (x, y) in AB_TILES and is_ab_poi(tags, kind):
+            e = poi_entry(tags, lat, lon, int(key[1:]))
+            if e is not None:
+                self.pois.setdefault((x, y, "a"), {})[key] = e
+                self.stats["pois"] += 1
+
+    def add_sign(self, key: str, tags: dict, lat: float, lon: float, frm: int, to: int):
+        """Wegweiser-Relation: nur, wenn einer der Wege im Paket ist."""
+        x = {s: tag(tags, k) for k, s in SIGN_TAGS.items() if tag(tags, k) is not None}
+        if "d" not in x and "dr" not in x:
+            return
+        e = [jround(lat * 1e5), jround(lon * 1e5), frm, to, x]
+        tx, ty = tile_ix(lon), tile_iy(lat)
+        if frm in self.road_ids or to in self.road_ids:
+            for detailed in self._targets(tx, ty):
+                self.signs.setdefault((tx, ty, detailed), {})[key] = e
+                self.stats["signs"] += 1
+        if (frm in self.ab_ids or to in self.ab_ids) and (tx, ty) in AB_TILES:
+            self.signs.setdefault((tx, ty, "a"), {})[key] = e
+            self.stats["signs"] += 1
 
     def add_road(self, key: str, tags: dict, coords: list[tuple[float, float]]):
-        if not (is_road(tags, True)):
+        if not (is_road(tags, True) or is_ab_road(tags)):
             return
         tiles = set()
         prev = None
@@ -193,25 +309,31 @@ class Collector:
                             tiles.add((xx, yy))
             prev = (lat, lon)
         entry = None
+        ab = is_ab_road(tags)
+        wid = int(key[1:])
         for (x, y) in tiles:
-            for detailed in self._targets(x, y):
-                if not is_road(tags, detailed):
-                    continue
+            layers = [d for d in self._targets(x, y) if is_road(tags, d)]
+            if ab and (x, y) in AB_TILES:
+                layers.append("a")
+            for layer in layers:
                 if entry is None:
                     pts = []
                     for lat, lon in coords:
                         pts.append(jround(lat * 1e5))
                         pts.append(jround(lon * 1e5))
-                    entry = road_entry(tags, pts)
+                    entry = road_entry(tags, pts, wid)
                     if entry is None:
                         return
-                self.roads.setdefault((x, y, detailed), {})[key] = entry
+                self.roads.setdefault((x, y, layer), {})[key] = entry
                 self.stats["roads"] += 1
+                self.road_ids.add(wid)
+                if layer == "a":
+                    self.ab_ids.add(wid)
 
 
 def relevant(tags: dict, kind: str) -> tuple[bool, bool]:
     """(ist Straße, ist Punkt) – großzügig (detailliert), genau gefiltert wird pro Kachel."""
-    return is_road(tags, True) and kind == "w", is_poi(tags, kind, True)
+    return (is_road(tags, True) or is_ab_road(tags)) and kind == "w", is_poi(tags, kind, True)
 
 
 def process_file(path: str, col: Collector):
@@ -220,10 +342,32 @@ def process_file(path: str, col: Collector):
 
     # 1) Relationen: passende merken, dazu ihre Mitglieder
     rels = {}
+    signs = {}   # Wegweiser-Relationen: id -> (tags, vonWeg, nachWeg, [Knoten], [Wege])
     member_ways: set[int] = set()
     member_nodes: set[int] = set()
-    for o in osmium.FileProcessor(path, osmium.osm.RELATION).with_filter(keys):
+    for o in osmium.FileProcessor(path, osmium.osm.RELATION).with_filter(osmium.filter.KeyFilter("highway", "amenity", "place", "type")):
         tags = dict(o.tags)
+        if tags.get("type") == "destination_sign":
+            frm = to = 0
+            nodes, ways = [], []
+            for m in o.members:
+                if m.type == "w" and m.role == "from":
+                    frm = m.ref
+                elif m.type == "w" and m.role == "to":
+                    to = m.ref
+                elif m.type == "n" and m.role == "intersection":
+                    nodes.insert(0, m.ref)   # Kreuzung zuerst
+                elif m.type == "n" and m.role == "sign":
+                    nodes.append(m.ref)      # sonst der Standort des Schilds
+            if to:
+                ways.append(to)
+            if frm:
+                ways.append(frm)
+            if (frm or to) and (nodes or ways):
+                signs[o.id] = (tags, frm, to, nodes, ways)
+                member_nodes.update(nodes)
+                member_ways.update(ways)
+            continue
         if not is_poi(tags, "r", True):
             continue
         mw, mn = [], []
@@ -263,7 +407,8 @@ def process_file(path: str, col: Collector):
     # 2b) Mitglieder der Relationen (auch Wege ohne passende Schlüssel, z. B. Außenringe von Flächen)
     way_bbox: dict[int, tuple[float, float, float, float]] = {}
     node_loc: dict[int, tuple[float, float]] = {}
-    if rels:
+    way_first: dict[int, tuple[float, float]] = {}
+    if rels or signs:
         ids = osmium.filter.IdFilter(member_ways | member_nodes)
         for o in osmium.FileProcessor(path, osmium.osm.NODE | osmium.osm.WAY).with_locations().with_filter(ids):
             if o.is_node():
@@ -275,6 +420,7 @@ def process_file(path: str, col: Collector):
                     lats = [c[0] for c in coords]
                     lons = [c[1] for c in coords]
                     way_bbox[o.id] = (min(lats), min(lons), max(lats), max(lons))
+                    way_first[o.id] = coords[0]
 
     # 3) Relationen: Mitte des Begrenzungsrechtecks aller Mitglieder
     for rid, (tags, mw, mn) in rels.items():
@@ -293,6 +439,12 @@ def process_file(path: str, col: Collector):
             continue
         col.add_poi("r%d" % rid, tags, "r", (min(lats) + max(lats)) / 2, (min(lons) + max(lons)) / 2)
 
+    # 4) Wegweiser-Relationen: an die Kreuzung (sonst Schild, sonst Anfang des Zielwegs) setzen
+    for rid, (tags, frm, to, nodes, ways) in signs.items():
+        pos = next((node_loc[n] for n in nodes if n in node_loc), None) or next((way_first[w] for w in ways if w in way_first), None)
+        if pos:
+            col.add_sign("r%d" % rid, tags, pos[0], pos[1], frm, to)
+
     print(f"  {os.path.basename(path)}: {nodes_seen} Knoten, {ways_seen} Wege, {len(rels)} Relationen geprüft "
           f"({time.time() - t0:.0f} s)", flush=True)
 
@@ -310,22 +462,80 @@ def osm_timestamp(paths: list[str]) -> str:
     return min(stamps) if stamps else ""
 
 
+def write_pack(out: str, manifest_path, name: str, tiles, col: Collector, pbf, now, osm_stand, datum, skip_empty: bool):
+    """Schreibt ein Paket. tiles: Liste (x, y, schicht)."""
+    t_ms = int(now.timestamp() * 1000)
+    files = []
+    tmp = out + ".tmp"
+    total = 0
+    suffix = {True: ".d.json", False: ".json", "a": ".a.json"}
+    with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+        for (x, y, layer) in tiles:
+            k = (x, y, layer)
+            r = list(col.roads.get(k, {}).values())
+            p = list(col.pois.get(k, {}).values())
+            s = list(col.signs.get(k, {}).values())
+            if skip_empty and not (r or p):
+                continue
+            tile = {"r": r, "p": p, "v": 2, "t": t_ms}
+            if s:
+                tile["s"] = s
+            data = json.dumps(tile, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            fname = f"{x}_{y}" + suffix[layer]
+            z.writestr(fname, data)
+            files.append({"datei": fname, "bytes": len(data), "wege": len(r), "punkte": len(p), "wegweiser": len(s)})
+            total += len(data)
+        manifest = {
+            "format": 2,
+            "name": name,
+            "datum": datum,
+            "osm_stand": osm_stand,
+            "erstellt": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "kachel_groesse": TILE,
+            "gebiet_schlank": list(REGION_SLIM),
+            "gebiet_detailliert": list(REGION_DETAIL),
+            "gebiet_autobahn": list(REGION_AB),
+            "quellen": [os.path.basename(q) for q in pbf],
+            "anzahl": len(files),
+            "bytes": total,
+            "kacheln": files,
+            "lizenz": "Kartendaten © OpenStreetMap-Mitwirkende, ODbL 1.0",
+        }
+        z.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=1).encode("utf-8"))
+    os.replace(tmp, out)
+    if manifest_path:
+        manifest["zip_bytes"] = os.path.getsize(out)
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=1)
+    filled = sum(1 for f in files if f["wege"] or f["punkte"])
+    print(f"Fertig: {out} – {len(files)} Kacheln ({filled} mit Daten), "
+          f"{total / 1e6:.1f} MB entpackt, {os.path.getsize(out) / 1e6:.1f} MB gepackt, Stand {datum}", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Kartenpaket für den Spur-Assistenten bauen")
     ap.add_argument("pbf", nargs="+", help="Geofabrik-Extrakte (.osm.pbf)")
-    ap.add_argument("--out", default="kartenpaket-nds-nrw.zip", help="Ziel-ZIP")
+    ap.add_argument("--out", default="kartenpaket-nds-nrw.zip", help="Ziel-ZIP (schlank + detailliert); leer = nicht bauen")
     ap.add_argument("--manifest", default=None, help="manifest.json zusätzlich hierhin schreiben")
+    ap.add_argument("--out-autobahn", default=None, help="Ziel-ZIP der Autobahn-Schicht (ganz Deutschland)")
+    ap.add_argument("--manifest-autobahn", default=None, help="Manifest der Autobahn-Schicht zusätzlich hierhin schreiben")
     ap.add_argument("--gebiet-schlank", default=None, help="nur für Tests: s,w,n,e statt Niedersachsen + NRW")
     ap.add_argument("--gebiet-detail", default=None, help="nur für Tests: s,w,n,e statt Nordhorn – Schüttorf")
+    ap.add_argument("--gebiet-autobahn", default=None, help="nur für Tests: s,w,n,e statt ganz Deutschland")
     args = ap.parse_args()
 
-    global REGION_SLIM, REGION_DETAIL, SLIM_TILES, DETAIL_TILES
+    global REGION_SLIM, REGION_DETAIL, REGION_AB, SLIM_TILES, DETAIL_TILES, AB_TILES
     if args.gebiet_schlank:
         REGION_SLIM = tuple(float(v) for v in args.gebiet_schlank.split(","))
         SLIM_TILES = set(tiles_of(REGION_SLIM))
     if args.gebiet_detail:
         REGION_DETAIL = tuple(float(v) for v in args.gebiet_detail.split(","))
         DETAIL_TILES = set(tiles_of(REGION_DETAIL))
+    if args.gebiet_autobahn:
+        REGION_AB = tuple(float(v) for v in args.gebiet_autobahn.split(","))
+        AB_TILES = set(tiles_of(REGION_AB))
+    if not args.out_autobahn:
+        AB_TILES = set()
 
     col = Collector()
     print("Lese Extrakte …", flush=True)
@@ -335,48 +545,14 @@ def main():
     now = dt.datetime.now(dt.timezone.utc)
     osm_stand = osm_timestamp(args.pbf)
     datum = (osm_stand[:10] if osm_stand else now.strftime("%Y-%m-%d"))
-    t_ms = int(now.timestamp() * 1000)
-
-    files = []
-    tmp = args.out + ".tmp"
-    total = 0
-    with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as z:
-        for (x, y) in sorted(SLIM_TILES | DETAIL_TILES, key=lambda t: (t[1], t[0])):
-            detailed = (x, y) in DETAIL_TILES
-            k = (x, y, detailed)
-            r = list(col.roads.get(k, {}).values())
-            p = list(col.pois.get(k, {}).values())
-            data = json.dumps({"r": r, "p": p, "t": t_ms}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-            name = f"{x}_{y}" + (".d.json" if detailed else ".json")
-            z.writestr(name, data)
-            files.append({"datei": name, "bytes": len(data), "wege": len(r), "punkte": len(p)})
-            total += len(data)
-        manifest = {
-            "format": 1,
-            "name": "kartenpaket-nds-nrw",
-            "datum": datum,
-            "osm_stand": osm_stand,
-            "erstellt": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "kachel_groesse": TILE,
-            "gebiet_schlank": list(REGION_SLIM),
-            "gebiet_detailliert": list(REGION_DETAIL),
-            "quellen": [os.path.basename(p) for p in args.pbf],
-            "anzahl": len(files),
-            "bytes": total,
-            "kacheln": files,
-            "lizenz": "Kartendaten © OpenStreetMap-Mitwirkende, ODbL 1.0",
-        }
-        mjson = json.dumps(manifest, ensure_ascii=False, indent=1).encode("utf-8")
-        z.writestr("manifest.json", mjson)
-    os.replace(tmp, args.out)
-    if args.manifest:
-        manifest["zip_bytes"] = os.path.getsize(args.out)
-        with open(args.manifest, "w", encoding="utf-8") as f:
-            json.dump(manifest, f, ensure_ascii=False, indent=1)
-    filled = sum(1 for f in files if f["wege"] or f["punkte"])
-    print(f"Fertig: {args.out} – {len(files)} Kacheln ({filled} mit Daten), "
-          f"{total / 1e6:.1f} MB entpackt, {os.path.getsize(args.out) / 1e6:.1f} MB gepackt, "
-          f"{col.stats['roads']} Weg- und {col.stats['pois']} Punkteinträge, Stand {datum}", flush=True)
+    order = lambda t: (t[1], t[0])
+    if args.out:
+        tiles = [(x, y, (x, y) in DETAIL_TILES) for (x, y) in sorted(SLIM_TILES | DETAIL_TILES, key=order)]
+        write_pack(args.out, args.manifest, "kartenpaket-nds-nrw", tiles, col, args.pbf, now, osm_stand, datum, skip_empty=False)
+    if args.out_autobahn:
+        tiles = [(x, y, "a") for (x, y) in sorted(AB_TILES, key=order)]
+        write_pack(args.out_autobahn, args.manifest_autobahn, "autobahnen-deutschland", tiles, col, args.pbf, now, osm_stand, datum, skip_empty=True)
+    print(f"{col.stats['roads']} Weg-, {col.stats['pois']} Punkt- und {col.stats['signs']} Wegweiser-Einträge", flush=True)
 
 
 if __name__ == "__main__":
